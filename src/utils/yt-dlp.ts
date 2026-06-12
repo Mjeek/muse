@@ -1,5 +1,6 @@
-import {execa} from 'execa';
+import {execa, ExecaChildProcess} from 'execa';
 import {constants as fsConstants, promises as fs} from 'fs';
+import {Readable} from 'stream';
 import path from 'path';
 
 const YT_DLP_VERSION_TIMEOUT_MS = 15_000;
@@ -26,6 +27,25 @@ export interface YtDlpMediaSource {
   readonly headers: Record<string, string>;
   readonly isLive: boolean;
 }
+
+export interface YtDlpMediaStream {
+  readonly stream: Readable;
+  readonly kill: () => void;
+}
+
+// Shared selection/extractor arguments so the metadata probe and the direct
+// stream below resolve the exact same format and player client.
+const YT_DLP_COMMON_ARGS = [
+  '--no-playlist',
+  '--no-warnings',
+  '--no-cache-dir',
+  '-f',
+  'bestaudio/best',
+  '-S',
+  'proto:https',
+  '--extractor-args',
+  'youtube:player_client=android_vr,default,-ios',
+];
 
 export interface YtDlpUpdateResult {
   readonly beforeVersion: string | null;
@@ -249,16 +269,8 @@ export const getYouTubeMediaSource = async (videoIdOrUrl: string): Promise<YtDlp
   try {
     const {stdout} = await execa(getExecutable(), [
       '--dump-single-json',
-      '--no-playlist',
       '--skip-download',
-      '--no-warnings',
-      '--no-cache-dir',
-      '-f',
-      'bestaudio/best',
-      '-S',
-      'proto:https',
-      '--extractor-args',
-      'youtube:player_client=android_vr,default,-ios',
+      ...YT_DLP_COMMON_ARGS,
       toYouTubeWatchUrl(videoIdOrUrl),
     ], {
       timeout: YT_DLP_EXTRACT_TIMEOUT_MS,
@@ -288,4 +300,55 @@ export const getYouTubeMediaSource = async (videoIdOrUrl: string): Promise<YtDlp
 
     throw error;
   }
+};
+
+/**
+ * Spawn yt-dlp and stream the media bytes directly to stdout instead of
+ * resolving a signed googlevideo.com URL for a separate HTTP client (ffmpeg)
+ * to fetch. Signed URLs are tied to the request context (client, cookies, PO
+ * token, and sometimes IP/session) that yt-dlp used, so handing the bare URL
+ * to ffmpeg often yields a 403. Piping keeps the entire request inside yt-dlp.
+ */
+export const createYouTubeMediaStream = (videoIdOrUrl: string): YtDlpMediaStream => {
+  const subprocess: ExecaChildProcess = execa(getExecutable(), [
+    ...YT_DLP_COMMON_ARGS,
+    '-o',
+    '-',
+    toYouTubeWatchUrl(videoIdOrUrl),
+  ], {
+    buffer: false,
+    stdin: 'ignore',
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+
+  const {stdout} = subprocess;
+  if (!stdout) {
+    throw new Error('yt-dlp did not expose a media stream.');
+  }
+
+  // Collect stderr for diagnostics; the media bytes go to stdout.
+  let stderr = '';
+  subprocess.stderr?.on('data', (chunk: Buffer) => {
+    stderr += chunk.toString();
+  });
+
+  // The promise rejects when yt-dlp exits non-zero (or is killed during
+  // cleanup). Surface real failures through the media stream so ffmpeg/the
+  // player can react, and swallow the expected rejection on intentional kills.
+  subprocess.catch((error: unknown) => {
+    if (subprocess.killed) {
+      return;
+    }
+
+    const detail = stderr.trim() || getExecaErrorMessage(error);
+    stdout.destroy(new Error(`yt-dlp failed to stream media: ${detail}`));
+  });
+
+  return {
+    stream: stdout,
+    kill: () => {
+      subprocess.kill('SIGKILL');
+    },
+  };
 };
