@@ -1,0 +1,39 @@
+# Self-hosted Muse with the bgutil PO token provider, built from THIS FORK
+# (so it includes the yt-dlp -> ffmpeg piping 403 fix).
+#
+# Compose can't chain the two FROM-dependent builds, so build the fork base
+# image once, then bring the stack up:
+#
+#   docker build -t muse-fork:local .
+#   docker compose -f docker-compose.bgutil.yml up -d --build
+#
+# Provide a cookies.txt next to this file (a logged-in YouTube cookie export).
+services:
+  muse:
+    build:
+      context: .
+      dockerfile: Dockerfile.bgutil
+      args:
+        # Image built from this fork via the repo's Dockerfile (step 1 above).
+        BASE_IMAGE: muse-fork:local
+    restart: always
+    volumes:
+      - ./muse:/data
+      - ./cookies.txt:/cookies.txt:ro
+    environment:
+      # Use the cookies + bgutil wrapper as yt-dlp (also baked into the image).
+      - YT_DLP_PATH=/usr/local/bin/yt-dlp-wrapper
+      - DISCORD_TOKEN=
+      - YOUTUBE_API_KEY=
+      - SPOTIFY_CLIENT_ID=
+      - SPOTIFY_CLIENT_SECRET=
+    depends_on:
+      - bgutil
+
+  # PO token provider. The hostname `bgutil` matches base_url=http://bgutil:4416
+  # in the yt-dlp wrapper (see Dockerfile.bgutil).
+  bgutil:
+    image: brainicism/bgutil-ytdlp-pot-provider
+    restart: always
+    expose:
+      - "4416"
