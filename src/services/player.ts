@@ -22,7 +22,7 @@ import FileCacheProvider from './file-cache.js';
 import debug from '../utils/debug.js';
 import {getGuildSettings} from '../utils/get-guild-settings.js';
 import {buildPlayingMessageEmbed} from '../utils/build-embed.js';
-import {getYouTubeMediaSource} from '../utils/yt-dlp.js';
+import {createYouTubeMediaStream} from '../utils/yt-dlp.js';
 import {Setting} from '@prisma/client';
 
 export enum MediaSource {
@@ -501,37 +501,10 @@ export default class {
     }
 
     if (song.source === MediaSource.HLS) {
-      return this.createReadStream({url: song.url, cacheKey: song.url});
+      return this.createReadStream({input: song.url, cacheKey: song.url});
     }
 
-    let ffmpegInput: string | null;
     const ffmpegInputOptions: string[] = [];
-    let shouldCacheVideo = false;
-
-    ffmpegInput = await this.fileCache.getPathFor(this.getHashForCache(song.url));
-
-    if (!ffmpegInput) {
-      const mediaSource = await getYouTubeMediaSource(song.url);
-      ffmpegInput = mediaSource.url;
-
-      // Don't cache livestreams or long videos
-      const MAX_CACHE_LENGTH_SECONDS = 30 * 60; // 30 minutes
-      shouldCacheVideo = !mediaSource.isLive && song.length < MAX_CACHE_LENGTH_SECONDS && !options.seek;
-
-      debug(shouldCacheVideo ? 'Caching video' : 'Not caching video');
-
-      ffmpegInputOptions.push(...[
-        '-reconnect',
-        '1',
-        '-reconnect_streamed',
-        '1',
-        '-reconnect_delay_max',
-        '5',
-      ]);
-
-      const headerOptions = this.buildFfmpegHeaderOptions(mediaSource.headers);
-      ffmpegInputOptions.push(...headerOptions);
-    }
 
     if (options.seek) {
       ffmpegInputOptions.push('-ss', options.seek.toString());
@@ -541,11 +514,34 @@ export default class {
       ffmpegInputOptions.push('-to', options.to.toString());
     }
 
+    // Use the transcoded copy from a previous play if we have one cached.
+    const cachedPath = await this.fileCache.getPathFor(this.getHashForCache(song.url));
+    if (cachedPath) {
+      return this.createReadStream({
+        input: cachedPath,
+        cacheKey: song.url,
+        ffmpegInputOptions,
+      });
+    }
+
+    // Don't cache livestreams or long videos.
+    const MAX_CACHE_LENGTH_SECONDS = 30 * 60; // 30 minutes
+    const shouldCacheVideo = !song.isLive && song.length < MAX_CACHE_LENGTH_SECONDS && !options.seek;
+
+    debug(shouldCacheVideo ? 'Caching video' : 'Not caching video');
+
+    // Pipe yt-dlp's output straight into ffmpeg rather than resolving a signed
+    // googlevideo.com URL for ffmpeg to fetch. The signed URL is bound to the
+    // exact request context (client, cookies, PO token, IP/session) yt-dlp
+    // used, so a fresh ffmpeg request to it is frequently rejected with a 403.
+    const mediaStream = createYouTubeMediaStream(song.url);
+
     return this.createReadStream({
-      url: ffmpegInput,
+      input: mediaStream.stream,
       cacheKey: song.url,
       ffmpegInputOptions,
       cache: shouldCacheVideo,
+      onCleanup: mediaStream.kill,
     });
   }
 
@@ -688,19 +684,7 @@ export default class {
     }
   }
 
-  private buildFfmpegHeaderOptions(headers: Record<string, string>) {
-    const headerLines = Object.entries(headers)
-      .map(([key, value]) => `${key}: ${value}`)
-      .join('\r\n');
-
-    if (!headerLines) {
-      return [];
-    }
-
-    return ['-headers', `${headerLines}\r\n`];
-  }
-
-  private async createReadStream(options: {url: string; cacheKey: string; ffmpegInputOptions?: string[]; cache?: boolean}): Promise<Readable> {
+  private async createReadStream(options: {input: string | Readable; cacheKey: string; ffmpegInputOptions?: string[]; cache?: boolean; onCleanup?: () => void}): Promise<Readable> {
     return new Promise((resolve, reject) => {
       const capacitor = new WriteStream();
 
@@ -712,12 +696,13 @@ export default class {
       const returnedStream = capacitor.createReadStream();
       let hasReturnedStreamClosed = false;
 
-      const stream = ffmpeg(options.url)
+      const stream = ffmpeg(options.input)
         .inputOptions(options?.ffmpegInputOptions ?? ['-re'])
         .noVideo()
         .audioCodec('libopus')
         .outputFormat('webm')
         .on('error', error => {
+          options.onCleanup?.();
           if (!hasReturnedStreamClosed) {
             reject(error);
           }
@@ -731,6 +716,7 @@ export default class {
       returnedStream.on('close', () => {
         if (!options.cache) {
           stream.kill('SIGKILL');
+          options.onCleanup?.();
         }
 
         hasReturnedStreamClosed = true;

@@ -1,0 +1,30 @@
+# Overlay image: builds on a Muse image built FROM THIS FORK'S SOURCE
+# (so it includes the yt-dlp -> ffmpeg piping 403 fix), then adds the
+# bgutil PO token provider plugin, Deno, and the yt-dlp wrapper.
+#
+# IMPORTANT: BASE_IMAGE must be an image built from this repo, NOT the
+# upstream ghcr.io/museofficial/muse image (that one does not contain the fix).
+#
+# Build the base from this fork first, then build this overlay:
+#   docker build -t muse-fork:local .
+#   docker build -t muse-bgutil:local -f Dockerfile.bgutil .
+ARG BASE_IMAGE=muse-fork:local
+FROM ${BASE_IMAGE}
+
+# Install Deno
+RUN apt-get update && apt-get install -y curl unzip && \
+    curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh && \
+    apt-get clean
+
+# Install bgutil POT provider plugin into the bundled yt-dlp venv
+RUN /opt/yt-dlp/bin/pip install bgutil-ytdlp-pot-provider
+
+# Wrapper with cookies + bgutil extractor arg. Muse invokes this via
+# YT_DLP_PATH, so cookies and the PO token apply to the real media download
+# (the streaming `-o -` call), not just metadata resolution.
+RUN printf '#!/bin/sh\ncp /cookies.txt /tmp/cookies.txt 2>/dev/null; exec /opt/yt-dlp/bin/yt-dlp --cookies /tmp/cookies.txt --remote-components ejs:github --extractor-args "youtubepot-bgutilhttp:base_url=http://bgutil:4416" "$@"\n' \
+    > /usr/local/bin/yt-dlp-wrapper && \
+    chmod +x /usr/local/bin/yt-dlp-wrapper
+
+# Make Muse use the wrapper as its yt-dlp.
+ENV YT_DLP_PATH=/usr/local/bin/yt-dlp-wrapper
